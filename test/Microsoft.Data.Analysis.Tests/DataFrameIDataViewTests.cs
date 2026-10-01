@@ -491,6 +491,74 @@ namespace Microsoft.Data.Analysis.Tests
             Assert.Equal(12, df.Columns.Count);
             Assert.Equal(2, df.Rows.Count);
         }
+
+        [Fact]
+        public void TestDataFrameIDataView_CanShuffle()
+        {
+            IDataView dataView = DataFrameTests.MakeDataFrameWithAllMutableColumnTypes(10, withNulls: false);
+            Assert.True(dataView.CanShuffle);
+        }
+
+        [Fact]
+        public void TestDataFrameIDataView_Shuffle_IsPermutation()
+        {
+            const int length = 20;
+            DataFrame df = DataFrameTests.MakeDataFrameWithAllMutableColumnTypes(length, withNulls: false);
+            IDataView dataView = df;
+
+            var defaultOrder = new List<long>();
+            using (var cursor = dataView.GetRowCursor(dataView.Schema))
+                while (cursor.MoveNext()) defaultOrder.Add(cursor.Position);
+
+            var shuffledOrder = new List<long>();
+            using (var cursor = dataView.GetRowCursor(dataView.Schema, new Random(42)))
+                while (cursor.MoveNext()) shuffledOrder.Add(cursor.Position);
+
+            Assert.Equal(length, shuffledOrder.Count);
+            // All row indices present (it's a permutation)
+            Assert.Equal(defaultOrder.OrderBy(x => x), shuffledOrder.OrderBy(x => x));
+            // Order is different from sequential
+            Assert.False(defaultOrder.SequenceEqual(shuffledOrder),
+                "Shuffled cursor should return rows in a different order than sequential");
+        }
+
+        [Theory]
+        [InlineData(1)]
+        [InlineData(3)]
+        [InlineData(5)]
+        public void TestDataFrameIDataView_ParallelCursors_CoverAllRows(int n)
+        {
+            const int length = 10;
+            DataFrame df = DataFrameTests.MakeDataFrameWithAllMutableColumnTypes(length, withNulls: false);
+            IDataView dataView = df;
+
+            DataViewRowCursor[] cursors = dataView.GetRowCursorSet(dataView.Schema, n, null);
+            var allRows = new List<long>();
+            var batches = new HashSet<long>();
+            foreach (var cursor in cursors)
+            {
+                batches.Add(cursor.Batch);
+                while (cursor.MoveNext()) allRows.Add(cursor.Position);
+                cursor.Dispose();
+            }
+
+            Assert.Equal(length, allRows.Count);
+            Assert.Equal(Enumerable.Range(0, length).Select(x => (long)x), allRows.OrderBy(x => x));
+            Assert.Equal(cursors.Length, batches.Count);
+        }
+
+        [Fact]
+        public void TestDataFrameIDataView_ParallelCursors_EmptyDataFrame()
+        {
+            var df = new DataFrame();
+            df.Columns.Add(new PrimitiveDataFrameColumn<int>("Int"));
+            IDataView dataView = df;
+
+            DataViewRowCursor[] cursors = dataView.GetRowCursorSet(dataView.Schema, 4, null);
+            Assert.Single(cursors);
+            Assert.False(cursors[0].MoveNext());
+            cursors[0].Dispose();
+        }
     }
 }
 

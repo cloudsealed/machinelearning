@@ -12,8 +12,7 @@ namespace Microsoft.Data.Analysis
 {
     public partial class DataFrame : IDataView
     {
-        // TODO: support shuffling
-        bool IDataView.CanShuffle => false;
+        bool IDataView.CanShuffle => true;
 
         private DataViewSchema _schema;
         private DataViewSchema DataViewSchema
@@ -40,7 +39,7 @@ namespace Microsoft.Data.Analysis
 
         long? IDataView.GetRowCount() => Rows.Count;
 
-        private DataViewRowCursor GetRowCursorCore(IEnumerable<DataViewSchema.Column> columnsNeeded)
+        private DataViewRowCursor GetRowCursorCore(IEnumerable<DataViewSchema.Column> columnsNeeded, Random rand = null)
         {
             var activeColumns = new bool[DataViewSchema.Count];
             foreach (DataViewSchema.Column column in columnsNeeded)
@@ -51,18 +50,41 @@ namespace Microsoft.Data.Analysis
                 }
             }
 
-            return new RowCursor(this, activeColumns);
+            return new RowCursor(this, activeColumns, 0, Rows.Count, 0, rand);
         }
 
         DataViewRowCursor IDataView.GetRowCursor(IEnumerable<DataViewSchema.Column> columnsNeeded, Random rand)
         {
-            return GetRowCursorCore(columnsNeeded);
+            return GetRowCursorCore(columnsNeeded, rand);
         }
 
         DataViewRowCursor[] IDataView.GetRowCursorSet(IEnumerable<DataViewSchema.Column> columnsNeeded, int n, Random rand)
         {
-            // TODO: change to support parallel cursors
-            return new DataViewRowCursor[] { GetRowCursorCore(columnsNeeded) };
+            var activeColumns = new bool[DataViewSchema.Count];
+            foreach (DataViewSchema.Column column in columnsNeeded)
+            {
+                if (column.Index < activeColumns.Length)
+                {
+                    activeColumns[column.Index] = true;
+                }
+            }
+
+            long rowCount = Rows.Count;
+            n = Math.Max(1, Math.Min(n, (int)Math.Min(rowCount == 0 ? 1 : rowCount, int.MaxValue)));
+
+            var cursors = new DataViewRowCursor[n];
+            long baseSize = rowCount / n;
+            long remainder = rowCount % n;
+            long start = 0;
+            for (int i = 0; i < n; i++)
+            {
+                long end = start + baseSize + (i < remainder ? 1 : 0);
+                // Each partition gets a derived seed so Random state is not shared across threads.
+                Random partitionRand = rand != null ? new Random(rand.Next()) : null;
+                cursors[i] = new RowCursor(this, activeColumns, start, end, i, partitionRand);
+                start = end;
+            }
+            return cursors;
         }
 
         private sealed class RowCursor : DataViewRowCursor
@@ -71,14 +93,36 @@ namespace Microsoft.Data.Analysis
             private long _position;
             private readonly DataFrame _dataFrame;
             private readonly Delegate[] _getters;
+            private readonly long _startRow;
+            private readonly long _endRow;
+            private readonly long _batch;
+            private readonly long[] _rowOrder; // non-null when shuffle is active
 
-            public RowCursor(DataFrame dataFrame, bool[] activeColumns)
+            public RowCursor(DataFrame dataFrame, bool[] activeColumns,
+                             long startRow = 0, long endRow = -1, long batch = 0, Random rand = null)
             {
                 Debug.Assert(dataFrame != null);
                 Debug.Assert(activeColumns != null);
 
                 _position = -1;
                 _dataFrame = dataFrame;
+                _startRow = startRow;
+                _endRow = endRow < 0 ? dataFrame.Rows.Count : endRow;
+                _batch = batch;
+
+                if (rand != null && _endRow > _startRow)
+                {
+                    long count = _endRow - _startRow;
+                    _rowOrder = new long[count];
+                    for (long i = 0; i < count; i++) _rowOrder[i] = _startRow + i;
+                    // Fisher-Yates shuffle
+                    for (long i = count - 1; i > 0; i--)
+                    {
+                        long j = (long)rand.Next(0, (int)(i + 1));
+                        (_rowOrder[i], _rowOrder[j]) = (_rowOrder[j], _rowOrder[i]);
+                    }
+                }
+
                 _getters = new Delegate[Schema.Count];
                 for (int i = 0; i < _getters.Length; i++)
                 {
@@ -89,8 +133,12 @@ namespace Microsoft.Data.Analysis
                 }
             }
 
-            public override long Position => _position;
-            public override long Batch => 0;
+            // Position must return the actual DataFrame row index because
+            // GetDataViewGetter captures this cursor and uses Position as the column index.
+            public override long Position => _rowOrder != null
+                ? (_position >= 0 ? _rowOrder[_position] : -1L)
+                : (_position >= 0 ? _startRow + _position : -1L);
+            public override long Batch => _batch;
             public override DataViewSchema Schema => _dataFrame.DataViewSchema;
 
             protected override void Dispose(bool disposing)
@@ -121,7 +169,7 @@ namespace Microsoft.Data.Analysis
 
             public override ValueGetter<DataViewRowId> GetIdGetter()
             {
-                return (ref DataViewRowId value) => value = new DataViewRowId((ulong)_position, 0);
+                return (ref DataViewRowId value) => value = new DataViewRowId((ulong)Position, 0);
             }
 
             public override bool IsColumnActive(DataViewSchema.Column column)
@@ -134,7 +182,8 @@ namespace Microsoft.Data.Analysis
                 if (_disposed)
                     return false;
                 _position++;
-                return _position < _dataFrame.Rows.Count;
+                long limit = _rowOrder?.Length ?? (_endRow - _startRow);
+                return _position < limit;
             }
         }
     }
